@@ -1,0 +1,35 @@
+# Lower-bound constraints (compatible with Python 3.10–3.13).
+# If you want fully reproducible builds, re-pin with `pip freeze` after install.
+
+# Core
+streamlit>=1.40
+pydantic>=2.9
+python-dotenv>=1.0
+
+# LangChain core + community
+langchain>=0.3.13
+langchain-core>=0.3.28
+langchain-community>=0.3.13
+langchain-text-splitters>=0.3.4
+
+# LLM providers (pluggable)
+langchain-anthropic>=0.3
+langchain-openai>=0.2.14
+langchain-google-genai>=2.0
+langchain-groq>=0.2
+langchain-huggingface>=0.1.2
+langchain-ollama>=0.2
+
+# Embeddings + vector store
+sentence-transformers>=3.3
+faiss-cpu>=1.9
+
+# Document loaders
+pypdf>=5.1
+
+# HuggingFace runtime
+huggingface-hub>=0.27
+transformers>=4.47
+# torchvision is not used by our code, but recent `transformers` versions
+# eagerly import image processors (zoedepth) that need it.
+torchvision>=0.20
