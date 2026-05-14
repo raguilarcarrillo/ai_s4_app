@@ -107,12 +107,23 @@ app/
 ├── embeddings_factory.py   # Pluggable embedding provider abstraction
 ├── rag.py                  # Loading, splitting, indexing, retrieval
 ├── prompts.py              # Teacher + quiz system prompts and templates
-└── quiz.py                 # Pydantic schema, generation, grading
+├── quiz.py                 # Pydantic schema, generation, grading
+└── pdf_export.py           # 📄 Save as PDF — markdown → PDF renderer
+
+docs/
+└── pdf-export.md           # Architecture + customization guide for PDF export
 
 requirements.txt            # Pinned dependencies for all providers
 .env.example                # Template for local env-var setup
 .streamlit/config.toml      # Streamlit server + theme config
 ```
+
+### PDF export
+
+Every assistant answer and quiz result has a `📄 Save as PDF` button that
+writes a `<topic>_<YYYY-MM-DD>.pdf` file into `~/Downloads/`. See
+[`docs/pdf-export.md`](docs/pdf-export.md) for the rendering pipeline,
+font story, emoji-to-tag map, customization knobs, and security notes.
 
 ---
 

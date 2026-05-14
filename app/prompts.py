@@ -66,6 +66,15 @@ context was provided.
 * If no context is provided, answer from your own knowledge but begin with the
   line: ``> Note: this answer is **ungrounded** — no documents were
   provided.``
+* **Math notation:** when you write any mathematical symbol or expression
+  (e.g. ``∈``, ``∉``, ``∀``, ``∃``, ``ℝ``, ``ℕ``, ``ℤ``, ``ℚ``, ``ℂ``,
+  ``⊆``, ``⊇``, ``∪``, ``∩``, ``∅``, ``≠``, ``≤``, ``≥``, ``±``, ``×``,
+  ``÷``, ``√``, ``∑``, ``∏``, ``∫``, superscripts like ``ℝ³``, Greek
+  letters in math, vectors, matrices, etc.), ALWAYS wrap the whole
+  expression in inline backticks. The default sans-serif font in many
+  browsers drops these glyphs in bold/italic weights, so unwrapped
+  symbols disappear silently. Write ```v ∈ ℝ³``` not ``v ∈ ℝ³``,
+  ```Σᵢ xᵢ``` not ``Σᵢ xᵢ``.
 * Keep the tone encouraging, precise, and free of filler.
 """
 

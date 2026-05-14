@@ -27,6 +27,10 @@ faiss-cpu>=1.9
 # Document loaders
 pypdf>=5.1
 
+# PDF export of chat / quiz outputs
+# Audited 2026-05-14: no known CVEs (GHSA-rwmj-c32v-585v targets PHP FPDF, not fpdf2).
+fpdf2>=2.8.7,<3.0.0
+
 # HuggingFace runtime
 huggingface-hub>=0.27
 transformers>=4.47

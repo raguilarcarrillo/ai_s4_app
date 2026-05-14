@@ -25,9 +25,12 @@ from typing import Any, List, Optional
 
 # Silence harmless transformers 5.x deprecation chatter from sentence-transformers'
 # eager imports (zoedepth __path__ alias). We never touch those modules.
+# Two layers: warnings.warn (used by some submodules) + logging (used by the
+# lazy-module __getattr__ that emits the __path__ alias notice).
 warnings.filterwarnings(
     "ignore", message=r".*Accessing `__path__`.*", module=r"transformers.*"
 )
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import streamlit as st
 
@@ -39,6 +42,7 @@ if str(_HERE) not in sys.path:
 
 from embeddings_factory import get_embeddings, list_embedding_backends  # noqa: E402
 from llm_factory import PROVIDERS, get_llm, list_providers  # noqa: E402
+from pdf_export import save_pdf_to_downloads  # noqa: E402
 from prompts import build_teacher_messages  # noqa: E402
 from quiz import GradeReport, Quiz, generate_quiz, grade_quiz  # noqa: E402
 from rag import (  # noqa: E402
@@ -327,6 +331,28 @@ def _get_vector_store_safe(cfg: dict[str, Any]) -> Optional[Any]:
         return None
 
 
+def _render_pdf_save_button(
+    title: str, content: str, *, key: str, label: str = "📄 Save as PDF"
+) -> None:
+    """Render a button that writes the given content as a PDF under ~/Downloads.
+
+    Args:
+        title: PDF title (also used as the filename stem).
+        content: Markdown body to render into the PDF.
+        key: Streamlit widget key — must be unique per call site.
+        label: Button text.
+    """
+    if not content or not content.strip():
+        return
+    if st.button(label, key=f"pdfbtn_{key}"):
+        try:
+            path = save_pdf_to_downloads(title=title, body_markdown=content)
+            st.success(f"Saved to `{path}`")
+        except Exception as e:
+            st.warning(f"Could not save PDF: {e}")
+            logger.exception("PDF save failed")
+
+
 def _render_sources(chunks: List[RetrievedChunk]) -> None:
     """Render an expandable source-citation block.
 
@@ -382,11 +408,17 @@ def _render_chat_tab(cfg: dict[str, Any]) -> None:
             "- *Compare gradient descent and Adam from the lecture notes.*"
         )
 
-    for msg in history:
+    for idx, msg in enumerate(history):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg["role"] == "assistant" and msg.get("sources"):
-                _render_sources(msg["sources"])
+            if msg["role"] == "assistant":
+                if msg.get("sources"):
+                    _render_sources(msg["sources"])
+                _render_pdf_save_button(
+                    title=_pdf_title_for_chat(history, idx),
+                    content=msg["content"],
+                    key=f"chat_hist_{idx}",
+                )
 
     user_input = st.chat_input("Type a question or topic…")
     if not user_input:
@@ -436,10 +468,29 @@ def _render_chat_tab(cfg: dict[str, Any]) -> None:
 
         placeholder.markdown(answer)
         _render_sources(sources)
+        _render_pdf_save_button(
+            title=_truncate_for_title(user_input),
+            content=answer,
+            key=f"chat_new_{len(history)}",
+        )
 
     history.append(
         {"role": "assistant", "content": answer, "sources": sources}
     )
+
+
+def _truncate_for_title(text: str, limit: int = 80) -> str:
+    """Trim a long prompt into a short, single-line PDF title."""
+    cleaned = " ".join((text or "").split())
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 1] + "…"
+
+
+def _pdf_title_for_chat(history: list[dict[str, Any]], assistant_idx: int) -> str:
+    """Pick the most recent user prompt before an assistant message as the title."""
+    for i in range(assistant_idx - 1, -1, -1):
+        if history[i].get("role") == "user":
+            return _truncate_for_title(history[i].get("content", ""))
+    return "Smart Teacher answer"
 
 
 def _friendly_llm_error(exc: Exception) -> str:
@@ -451,7 +502,28 @@ def _friendly_llm_error(exc: Exception) -> str:
     Returns:
         A short Markdown error message.
     """
+    # Non-ASCII header value almost always means the user pasted prompt
+    # text into the API key field — HTTP forbids non-latin-1 in header
+    # values, so the provider client raises UnicodeEncodeError before
+    # the request leaves the machine.
+    if isinstance(exc, UnicodeEncodeError):
+        return (
+            "⚠️ API key looks invalid — it contains non-ASCII characters. "
+            "This usually means prompt text was pasted into the API key "
+            "field by mistake. Clear the key in the sidebar and paste "
+            "the actual key (e.g. `gsk_…` for Groq, `sk-…` for OpenAI, "
+            "`sk-ant-…` for Anthropic, `AIza…` for Gemini, `hf_…` for "
+            "HuggingFace)."
+        )
+
     msg = str(exc).lower()
+    # Some clients wrap the underlying UnicodeEncodeError; sniff the text.
+    if "codec can't encode" in msg and "ascii" in msg:
+        return (
+            "⚠️ API key contains invalid characters. Re-check the key in "
+            "the sidebar — only ASCII characters are allowed in header "
+            "values."
+        )
     if "rate limit" in msg or "429" in msg:
         return (
             "⚠️ Provider rate limit hit. Wait a moment, lower the "
@@ -590,6 +662,78 @@ def _generate_and_store_quiz(
     st.toast(f"Generated {len(quiz.questions)} question(s).")
 
 
+def _quiz_to_markdown(quiz: Quiz, *, include_answers: bool = False) -> str:
+    """Render a quiz as markdown suitable for PDF export."""
+    lines: list[str] = [
+        f"# Quiz: {quiz.topic}",
+        f"*Difficulty:* **{quiz.difficulty}** · *Questions:* **{len(quiz.questions)}**",
+        "",
+    ]
+    for q in quiz.questions:
+        lines.append(f"## Q{q.id}. {q.prompt}")
+        if q.type == "multiple_choice" and q.options:
+            for i, opt in enumerate(q.options):
+                lines.append(f"- {chr(65 + i)}. {opt}")
+        elif q.type == "true_false":
+            lines.append("- True")
+            lines.append("- False")
+        if include_answers:
+            try:
+                if q.type in {"multiple_choice", "true_false"} and q.options:
+                    answer_label = q.options[int(q.correct_answer)]
+                else:
+                    answer_label = str(q.correct_answer)
+            except (TypeError, ValueError, IndexError):
+                answer_label = str(q.correct_answer)
+            lines.append("")
+            lines.append(f"**Answer:** {answer_label}")
+            if q.explanation:
+                lines.append(f"**Why:** {q.explanation}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _grade_report_to_markdown(quiz: Quiz, report: GradeReport) -> str:
+    """Render a graded quiz report as markdown suitable for PDF export."""
+    lines: list[str] = [
+        f"# Quiz results: {quiz.topic}",
+        f"**Score:** {report.score} / {report.total} ({report.percent:.1f}%)",
+        f"*Difficulty:* {quiz.difficulty}",
+        "",
+        "---",
+        "",
+    ]
+    by_id = {q.id: q for q in quiz.questions}
+    for r in report.per_question:
+        q = by_id.get(r.id)
+        if q is None:
+            continue
+        icon = "[OK]" if r.correct else "[X]"
+        lines.append(f"## {icon} Q{q.id}. {q.prompt}")
+        try:
+            if q.type in {"multiple_choice", "true_false"} and q.options:
+                correct_label = q.options[int(q.correct_answer)]
+                user_label = (
+                    q.options[int(r.user_answer)]
+                    if r.user_answer is not None
+                    else "(blank)"
+                )
+            else:
+                correct_label = str(q.correct_answer)
+                user_label = r.user_answer or "(blank)"
+        except (TypeError, ValueError, IndexError):
+            correct_label = str(q.correct_answer)
+            user_label = str(r.user_answer) if r.user_answer is not None else "(blank)"
+        lines.append(f"- **Correct answer:** {correct_label}")
+        lines.append(f"- **Your answer:** {user_label}")
+        if q.explanation:
+            lines.append(f"- **Why:** {q.explanation}")
+        if r.source_refs:
+            lines.append(f"- **Sources:** {', '.join(r.source_refs)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _render_active_quiz() -> None:
     """Render the active quiz form, grading, and retry actions."""
     quiz: Quiz = st.session_state["quiz"]
@@ -599,6 +743,12 @@ def _render_active_quiz() -> None:
 
     st.markdown("---")
     st.markdown(f"### {quiz.topic}  · _{quiz.difficulty}_")
+    _render_pdf_save_button(
+        title=f"Quiz - {quiz.topic}",
+        content=_quiz_to_markdown(quiz, include_answers=False),
+        key=f"quiz_{id(quiz)}",
+        label="📄 Save quiz as PDF",
+    )
 
     with st.form("quiz_form", clear_on_submit=False):
         for q in quiz.questions:
@@ -695,6 +845,13 @@ def _render_grade_report(quiz: Quiz, report: GradeReport) -> None:
 
     if st.session_state.get("quiz_sources"):
         _render_sources(st.session_state["quiz_sources"])
+
+    _render_pdf_save_button(
+        title=f"Quiz results - {quiz.topic}",
+        content=_grade_report_to_markdown(quiz, report),
+        key=f"report_{id(report)}",
+        label="📄 Save results as PDF",
+    )
 
     col_a, col_b = st.columns(2)
     with col_a:
