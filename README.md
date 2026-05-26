@@ -120,10 +120,12 @@ requirements.txt            # Pinned dependencies for all providers
 
 ### PDF export
 
-Every assistant answer and quiz result has a `📄 Save as PDF` button that
-writes a `<topic>_<YYYY-MM-DD>.pdf` file into `~/Downloads/`. See
-[`docs/pdf-export.md`](docs/pdf-export.md) for the rendering pipeline,
-font story, emoji-to-tag map, customization knobs, and security notes.
+Every assistant answer and quiz result has a `📄 Download as PDF` button
+that streams a `<topic>_<YYYY-MM-DD>.pdf` to the browser via
+`st.download_button` — no server-side writes, works on HuggingFace
+Spaces. See [`docs/pdf-export.md`](docs/pdf-export.md) for the rendering
+pipeline, font story, emoji handling, customization knobs, and security
+notes.
 
 ---
 

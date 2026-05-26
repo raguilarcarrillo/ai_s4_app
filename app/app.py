@@ -16,12 +16,23 @@ Run locally::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sys
-import traceback
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, List, Optional
+
+# Load .env from the project root (one level up from app/) before any
+# downstream module reads os.environ. Silent no-op if .env is absent or
+# python-dotenv isn't installed.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
 
 # Silence harmless transformers 5.x deprecation chatter from sentence-transformers'
 # eager imports (zoedepth __path__ alias). We never touch those modules.
@@ -42,7 +53,7 @@ if str(_HERE) not in sys.path:
 
 from embeddings_factory import get_embeddings, list_embedding_backends  # noqa: E402
 from llm_factory import PROVIDERS, get_llm, list_providers  # noqa: E402
-from pdf_export import save_pdf_to_downloads  # noqa: E402
+from pdf_export import markdown_to_pdf_bytes, pdf_filename  # noqa: E402
 from prompts import build_teacher_messages  # noqa: E402
 from quiz import GradeReport, Quiz, generate_quiz, grade_quiz  # noqa: E402
 from rag import (  # noqa: E402
@@ -64,15 +75,17 @@ logger = logging.getLogger("smart_teacher")
 # ---------------------------------------------------------------------------
 
 
+# Embeddings have no user-supplied secrets in the current design — they
+# either run locally (sentence-transformers) or read env vars set at deploy
+# time. A process-wide cache is therefore safe and avoids re-loading the
+# ~80 MB local model per browser session.
 @st.cache_resource(show_spinner="Loading embedding model…")
-def _cached_embeddings(backend: str, model: str, key_hint: str) -> Any:
-    """Cache the embedding model. ``key_hint`` participates in the cache key.
+def _cached_embeddings(backend: str, model: str) -> Any:
+    """Cache the embedding model.
 
     Args:
         backend: Embeddings backend id.
         model: Model identifier.
-        key_hint: Truncated hint of the API key so re-keying invalidates the
-            cache without storing the raw secret.
 
     Returns:
         A LangChain ``Embeddings`` instance.
@@ -80,6 +93,9 @@ def _cached_embeddings(backend: str, model: str, key_hint: str) -> Any:
     return get_embeddings(backend=backend, model=model)
 
 
+# Indexing is keyed by a sha256 fingerprint of file bytes + chunk params, so
+# cache hits across sessions only occur on byte-identical inputs. No user
+# secret participates.
 @st.cache_resource(show_spinner="Indexing documents…")
 def _cached_vector_store(
     index_fingerprint: str,
@@ -117,45 +133,87 @@ def _cached_vector_store(
     return build_vector_store(chunks, _embeddings)
 
 
-@st.cache_resource(show_spinner="Connecting to LLM…")
-def _cached_llm(
-    provider: str,
-    model: str,
-    temperature: float,
-    key_hint: str,
-) -> Any:
-    """Cache the LLM client.
-
-    Args:
-        provider: Provider id.
-        model: Model identifier.
-        temperature: Sampling temperature.
-        key_hint: Truncated hint of the key so re-keying invalidates the
-            cache without storing the secret.
-
-    Returns:
-        A configured LangChain chat model.
-    """
-    return get_llm(
-        provider=provider,
-        model=model,
-        temperature=temperature,
-        api_key=st.session_state.get(f"key::{provider}"),
-    )
-
-
 def _key_hint(value: Optional[str]) -> str:
     """Derive a non-sensitive cache hint from an API key.
+
+    Uses sha256 so the hint is collision-resistant *and* unrecoverable —
+    safe to put in cache keys, logs, or telemetry.
 
     Args:
         value: The raw key, or ``None``.
 
     Returns:
-        First/last 2 chars joined by ``…`` (or ``"none"``).
+        16-char hex prefix of sha256(value), or ``"none"``.
     """
     if not value:
         return "none"
-    return f"{value[:2]}…{value[-2:]}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_llm_for_session(
+    provider: str,
+    model: str,
+    temperature: float,
+    api_key: Optional[str],
+) -> Any:
+    """Build (and per-session-cache) a chat LLM client.
+
+    The cache lives in ``st.session_state`` so each browser session has its
+    own client bound to its own key. This prevents the cross-tenant leak
+    you'd get from ``@st.cache_resource`` (process-wide). An LRU bound of
+    four entries keeps memory in check when the user flips providers /
+    models repeatedly.
+
+    Args:
+        provider: Provider id.
+        model: Model identifier.
+        temperature: Sampling temperature.
+        api_key: The session's API key for ``provider``.
+
+    Returns:
+        A configured LangChain chat model.
+    """
+    cache: "OrderedDict[str, Any]" = st.session_state.setdefault(
+        "_llm_cache", OrderedDict()
+    )
+    cache_key = (
+        f"{provider}::{model}::{temperature:.4f}::{_key_hint(api_key)}"
+    )
+    if cache_key in cache:
+        cache.move_to_end(cache_key)
+        return cache[cache_key]
+    with st.spinner("Connecting to LLM…"):
+        client = get_llm(
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            api_key=api_key,
+        )
+    cache[cache_key] = client
+    while len(cache) > 4:
+        cache.popitem(last=False)
+    return client
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace any session API key occurrences in ``text`` with a placeholder.
+
+    Belt-and-suspenders: provider SDK errors occasionally embed the bearer
+    token in the message. We strip those before rendering anything to the
+    UI so the page never echoes a secret back at the user.
+    """
+    if not text:
+        return text
+    redacted = text
+    for k, v in list(st.session_state.items()):
+        if (
+            isinstance(k, str)
+            and k.startswith("key::")
+            and isinstance(v, str)
+            and v
+        ):
+            redacted = redacted.replace(v, "***REDACTED***")
+    return redacted
 
 
 # ---------------------------------------------------------------------------
@@ -274,23 +332,21 @@ def _get_llm_safe(cfg: dict[str, Any]) -> Optional[Any]:
         The LLM instance, or ``None`` if construction failed.
     """
     try:
-        return _cached_llm(
+        return _get_llm_for_session(
             provider=cfg["provider"],
             model=cfg["model"],
             temperature=cfg["temperature"],
-            key_hint=_key_hint(
-                st.session_state.get(f"key::{cfg['provider']}")
-            ),
+            api_key=st.session_state.get(f"key::{cfg['provider']}"),
         )
     except ValueError as e:
-        st.error(str(e))
+        st.error(_redact_secrets(str(e)))
     except ImportError as e:
         st.error(
             f"Provider package missing: {e}. Install it via "
             "`pip install -r requirements.txt`."
         )
     except Exception as e:
-        st.error(f"Failed to initialize LLM: {e}")
+        st.error(_redact_secrets(f"Failed to initialize LLM: {e}"))
         logger.exception("LLM init failed")
     return None
 
@@ -311,9 +367,6 @@ def _get_vector_store_safe(cfg: dict[str, Any]) -> Optional[Any]:
         embeddings = _cached_embeddings(
             backend=cfg["embed_backend"],
             model=cfg["embed_model"],
-            key_hint=_key_hint(
-                st.session_state.get(f"key::{cfg['provider']}")
-            ),
         )
         fp = fingerprint(files, cfg["chunk_size"], cfg["chunk_overlap"])
         return _cached_vector_store(
@@ -326,15 +379,40 @@ def _get_vector_store_safe(cfg: dict[str, Any]) -> Optional[Any]:
             _embeddings=embeddings,
         )
     except Exception as e:
-        st.error(f"Failed to index documents: {e}")
+        st.error(_redact_secrets(f"Failed to index documents: {e}"))
         logger.exception("Indexing failed")
         return None
 
 
+def _get_pdf_bytes(title: str, content: str) -> bytes:
+    """Render content to PDF bytes, memoized in session state.
+
+    The cache is per-browser-session and bounded so a long chat doesn't
+    pin unbounded memory. Bytes-by-bytes generation is expensive enough
+    that we'd otherwise pay for every Streamlit rerun.
+    """
+    cache: "OrderedDict[str, bytes]" = st.session_state.setdefault(
+        "_pdf_cache", OrderedDict()
+    )
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    cache_key = f"{title}::{digest}"
+    if cache_key in cache:
+        cache.move_to_end(cache_key)
+        return cache[cache_key]
+    pdf_bytes = markdown_to_pdf_bytes(title, content)
+    cache[cache_key] = pdf_bytes
+    while len(cache) > 32:
+        cache.popitem(last=False)
+    return pdf_bytes
+
+
 def _render_pdf_save_button(
-    title: str, content: str, *, key: str, label: str = "📄 Save as PDF"
+    title: str, content: str, *, key: str, label: str = "📄 Download as PDF"
 ) -> None:
-    """Render a button that writes the given content as a PDF under ~/Downloads.
+    """Render a Streamlit download_button delivering the content as a PDF.
+
+    The browser saves the file via its own download flow — no filesystem
+    writes on the server, so this works on HuggingFace Spaces too.
 
     Args:
         title: PDF title (also used as the filename stem).
@@ -344,13 +422,19 @@ def _render_pdf_save_button(
     """
     if not content or not content.strip():
         return
-    if st.button(label, key=f"pdfbtn_{key}"):
-        try:
-            path = save_pdf_to_downloads(title=title, body_markdown=content)
-            st.success(f"Saved to `{path}`")
-        except Exception as e:
-            st.warning(f"Could not save PDF: {e}")
-            logger.exception("PDF save failed")
+    try:
+        pdf_bytes = _get_pdf_bytes(title, content)
+    except Exception as e:
+        st.warning(f"Could not generate PDF: {e}")
+        logger.exception("PDF generation failed")
+        return
+    st.download_button(
+        label=label,
+        data=pdf_bytes,
+        file_name=pdf_filename(title, content),
+        mime="application/pdf",
+        key=f"pdfbtn_{key}",
+    )
 
 
 def _render_sources(chunks: List[RetrievedChunk]) -> None:
@@ -459,7 +543,8 @@ def _render_chat_tab(cfg: dict[str, Any]) -> None:
                 response = llm.invoke(messages)
             answer = getattr(response, "content", str(response))
         except Exception as e:
-            err = _friendly_llm_error(e)
+            logger.exception("LLM invoke failed")
+            err = _redact_secrets(_friendly_llm_error(e))
             placeholder.error(err)
             history.append(
                 {"role": "assistant", "content": err, "sources": []}
@@ -495,6 +580,10 @@ def _pdf_title_for_chat(history: list[dict[str, Any]], assistant_idx: int) -> st
 
 def _friendly_llm_error(exc: Exception) -> str:
     """Translate raw LLM exceptions into actionable user-facing text.
+
+    Any returned string is passed through ``_redact_secrets`` so a provider
+    SDK that embeds the bearer token in its error message can never echo
+    that token to the page.
 
     Args:
         exc: The caught exception.
@@ -538,9 +627,14 @@ def _friendly_llm_error(exc: Exception) -> str:
             "⚠️ Network error reaching the provider. Check your connection "
             "or try Ollama for local inference."
         )
+    # Surface only the exception class + first line. The full traceback
+    # goes to server logs (logger.exception is called at the call site),
+    # never to the UI — that's how we avoid leaking filesystem paths,
+    # dependency versions, or anything else internal.
+    first_line = next(iter(str(exc).splitlines()), "") or "no message"
     return (
-        f"⚠️ Unexpected error: `{exc}`. See logs for the traceback.\n\n"
-        f"```\n{traceback.format_exc(limit=2)}\n```"
+        f"⚠️ Unexpected error ({type(exc).__name__}): `{first_line}`. "
+        "Check the server logs for the traceback."
     )
 
 
@@ -652,7 +746,8 @@ def _generate_and_store_quiz(
                 context_chunks=chunks,
             )
     except Exception as e:
-        st.error(_friendly_llm_error(e))
+        logger.exception("Quiz generation failed")
+        st.error(_redact_secrets(_friendly_llm_error(e)))
         return
 
     st.session_state["quiz"] = quiz

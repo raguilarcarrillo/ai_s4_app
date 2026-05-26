@@ -605,6 +605,23 @@ def markdown_to_pdf_bytes(title: str, body_markdown: str) -> bytes:
     return bytes(out)
 
 
+def pdf_filename(title: str, body_markdown: str) -> str:
+    """Return the filename a saved PDF would use, without writing the file.
+
+    Useful for ``st.download_button(file_name=...)`` so the browser download
+    matches what ``save_pdf_to_downloads`` would have produced.
+
+    Args:
+        title: Fallback title when the body has no H1.
+        body_markdown: PDF body content.
+
+    Returns:
+        ``<topic-slug>_<YYYY-MM-DD>.pdf``.
+    """
+    topic = _extract_topic(body_markdown, title)
+    return _build_filename(topic)
+
+
 def save_pdf_to_downloads(
     title: str,
     body_markdown: str,

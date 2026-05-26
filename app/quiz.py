@@ -287,9 +287,17 @@ def _grade_one(
     else:  # short_answer
         expected = _normalize_short_answer(str(q.correct_answer))
         got = _normalize_short_answer(str(user_answer))
-        correct = bool(expected) and (
-            got == expected or expected in got or got in expected
-        )
+        if not expected:
+            correct = False
+        elif got == expected:
+            correct = True
+        else:
+            # Whole-word/phrase match — expected must appear as a contiguous
+            # sequence of words inside got. Prevents single-letter expected
+            # answers from matching any text that happens to contain them.
+            correct = bool(
+                re.search(rf"\b{re.escape(expected)}\b", got)
+            )
 
     return QuestionResult(
         id=q.id,

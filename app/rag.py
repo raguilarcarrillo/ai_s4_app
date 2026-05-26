@@ -94,18 +94,30 @@ def load_uploaded_files(uploaded_files: Iterable[Any]) -> List[Document]:
     """
     documents: List[Document] = []
     with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_resolved = Path(tmpdir).resolve()
         for up in uploaded_files:
-            name = getattr(up, "name", "uploaded")
-            suffix = Path(name).suffix.lower()
-            if suffix not in SUPPORTED_SUFFIXES:
-                logger.warning("Skipping unsupported file %s", name)
+            raw_name = getattr(up, "name", "uploaded")
+            # Strip any path components a hostile client might send. The
+            # basename is also what flows into chunk metadata and therefore
+            # into LLM prompts, so we want it clean.
+            safe_name = Path(raw_name).name
+            if not safe_name or safe_name in {".", ".."}:
+                logger.warning("Skipping suspicious filename %r", raw_name)
                 continue
-            tmp_path = Path(tmpdir) / name
+            suffix = Path(safe_name).suffix.lower()
+            if suffix not in SUPPORTED_SUFFIXES:
+                logger.warning("Skipping unsupported file %s", safe_name)
+                continue
+            tmp_path = (tmpdir_resolved / safe_name).resolve()
+            # Defense-in-depth: refuse to write outside the temp directory.
+            if tmpdir_resolved not in tmp_path.parents:
+                logger.warning("Refusing to write %s outside tempdir", safe_name)
+                continue
             tmp_path.write_bytes(up.getbuffer())
             try:
-                documents.extend(_read_file_to_documents(tmp_path, name))
+                documents.extend(_read_file_to_documents(tmp_path, safe_name))
             except Exception:
-                logger.exception("Failed to load %s", name)
+                logger.exception("Failed to load %s", safe_name)
     return documents
 
 

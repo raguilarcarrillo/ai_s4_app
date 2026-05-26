@@ -11,14 +11,17 @@ serialized outside Streamlit, so it's worth understanding before changing.
 ## What the feature does
 
 Every assistant reply in the **Chat** tab and every quiz / grade report in
-the **Quiz** tab is accompanied by a `📄 Save as PDF` button. When the
+the **Quiz** tab is accompanied by a `📄 Download as PDF` button. When the
 user clicks it:
 
-1. The markdown content for that specific message is rendered into a PDF
-   in-memory (no temp file).
-2. The PDF is written to `~/Downloads/` with a short filename of the
-   form `<topic-slug>_<YYYY-MM-DD>.pdf`.
-3. A green Streamlit `success` banner shows the absolute path.
+1. The markdown content for that specific message has already been rendered
+   to PDF bytes in-memory (memoized in `st.session_state` so reruns are
+   cheap; no temp file).
+2. Streamlit's `st.download_button` streams those bytes to the browser,
+   which saves the file with the suggested name
+   `<topic-slug>_<YYYY-MM-DD>.pdf`.
+3. No server-side filesystem writes — this works identically on local dev
+   and on HuggingFace Spaces.
 
 No network call, no third-party service.
 
@@ -42,6 +45,7 @@ trivial to unit-test or reuse in a CLI tool later.
 
 ```python
 def markdown_to_pdf_bytes(title: str, body_markdown: str) -> bytes: ...
+def pdf_filename(title: str, body_markdown: str) -> str: ...
 def save_pdf_to_downloads(
     title: str,
     body_markdown: str,
@@ -50,12 +54,15 @@ def save_pdf_to_downloads(
 ) -> Path: ...
 ```
 
-- `markdown_to_pdf_bytes` returns raw PDF bytes — usable from
-  `st.download_button` if you ever want a browser-streamed alternative.
+- `markdown_to_pdf_bytes` returns raw PDF bytes — fed directly to
+  `st.download_button(data=...)` by `app.py`.
+- `pdf_filename` returns the suggested filename
+  (`<topic-slug>_<YYYY-MM-DD>.pdf`) without touching the filesystem.
 - `save_pdf_to_downloads` writes the PDF under `~/Downloads/` (overridable
-  for tests via `downloads_dir=`) and returns the absolute path.
+  for tests via `downloads_dir=`) and returns the absolute path. It's no
+  longer used by the UI — kept as a programmatic helper for CLI / scripting.
 
-Both accept the same content. `title` is used as the document heading and
+All accept the same content. `title` is used as the document heading and
 as the **fallback** for the filename topic. If the body markdown starts
 with an `# H1` heading, the topic is extracted from that H1 instead — so
 the filename matches the subject the LLM actually wrote about, not the
@@ -180,17 +187,28 @@ so users aren't left with five near-identical PDFs.
 Three call sites, all using one small helper:
 
 ```python
-def _render_pdf_save_button(title: str, content: str, *, key: str, label: str = "📄 Save as PDF") -> None:
+def _render_pdf_save_button(title: str, content: str, *, key: str, label: str = "📄 Download as PDF") -> None:
     if not content or not content.strip():
         return
-    if st.button(label, key=f"pdfbtn_{key}"):
-        try:
-            path = save_pdf_to_downloads(title=title, body_markdown=content)
-            st.success(f"Saved to `{path}`")
-        except Exception as e:
-            st.warning(f"Could not save PDF: {e}")
-            logger.exception("PDF save failed")
+    try:
+        pdf_bytes = _get_pdf_bytes(title, content)   # memoized in st.session_state
+    except Exception as e:
+        st.warning(f"Could not generate PDF: {e}")
+        logger.exception("PDF generation failed")
+        return
+    st.download_button(
+        label=label,
+        data=pdf_bytes,
+        file_name=pdf_filename(title, content),
+        mime="application/pdf",
+        key=f"pdfbtn_{key}",
+    )
 ```
+
+`_get_pdf_bytes` caches the rendered bytes per browser session (LRU,
+32-entry cap, keyed by `sha256(content)` plus the title) so a chat with
+many historical messages doesn't re-render PDFs on every Streamlit
+rerun.
 
 1. **Chat history loop** — each historical assistant message gets a button
    with key `chat_hist_<idx>`. The title is the user's prompt that
@@ -299,3 +317,8 @@ Edge cases worth exercising when changing the renderer:
 - **2026-05-14** — changed emoji policy from text tags (`[MAP]`, `[OK]`
   …) to clean stripping. Headings now appear without leading glyphs or
   brackets.
+- **2026-05-26** — switched UI from `save_pdf_to_downloads` (filesystem
+  write to `~/Downloads/`) to `st.download_button` so PDFs are delivered
+  via the browser. Works correctly on HuggingFace Spaces; no server-side
+  filesystem writes. Added `pdf_filename` helper and a session-scoped
+  LRU cache for rendered bytes.
