@@ -37,3 +37,21 @@ transformers>=4.47
 # torchvision is not used by our code, but recent `transformers` versions
 # eagerly import image processors (zoedepth) that need it.
 torchvision>=0.20
+
+# Inline chart rendering (Plotly figures embedded in chat replies).
+# Audited 2026-05-27: plotly Python has no known CVEs (Snyk DB); the only
+# historical advisory (GHSA-2fqv-h3r5-m4vf) was a 2017 XSS in plotly.js
+# fixed in 1.16.0. Math expressions inside chart blocks are evaluated by
+# a custom ast-whitelist validator (see app/charts.py), so no symbolic
+# math library is needed and no attack surface from sympy/sympify is
+# inherited.
+
+plotly>=5.20,<7.0
+
+# Static image export for embedding charts into PDFs.
+# Audited 2026-05-27: 0 GitHub Advisory entries for the Python "kaleido"
+# package. v1.x relies on a system-installed Chrome rather than bundling
+# its own Chromium binary, so Chrome patches apply normally. On hosts
+# without Chrome (e.g. a default HuggingFace Space image), PDF chart
+# embedding gracefully falls back to a "[Chart: <title>]" placeholder.
+kaleido>=1.2.0,<2.0

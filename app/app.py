@@ -51,6 +51,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import charts  # noqa: E402
 import persistence  # noqa: E402
 from embeddings_factory import get_embeddings, list_embedding_backends  # noqa: E402
 from llm_factory import PROVIDERS, get_llm, list_providers  # noqa: E402
@@ -633,6 +634,33 @@ def _render_pdf_save_button(
     )
 
 
+def _render_assistant_content(content: str, *, key_prefix: str) -> None:
+    """Render an assistant reply, splitting out any inline chart blocks.
+
+    Markdown surrounding the chart goes through ``st.markdown`` as before;
+    chart blocks become interactive Plotly canvases. A chart block that
+    fails to parse falls back to its raw fenced source plus a one-line
+    caption so the user can see what the LLM tried to do.
+    """
+    if not content:
+        return
+    for i, (kind, payload) in enumerate(charts.split_text_and_charts(content)):
+        if kind == "text":
+            if payload.strip():
+                st.markdown(payload)
+        else:  # "chart"
+            fig, err = charts.render(payload)
+            if fig is not None:
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key=f"chart_{key_prefix}_{i}",
+                )
+            else:
+                st.code(payload, language="json")
+                st.caption(f"Chart could not be rendered: {err}")
+
+
 def _render_sources(chunks: List[RetrievedChunk]) -> None:
     """Render an expandable source-citation block.
 
@@ -690,7 +718,10 @@ def _render_chat_tab(cfg: dict[str, Any]) -> None:
 
     for idx, msg in enumerate(history):
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            if msg["role"] == "assistant":
+                _render_assistant_content(msg["content"], key_prefix=f"hist_{idx}")
+            else:
+                st.markdown(msg["content"])
             if msg["role"] == "assistant":
                 if msg.get("sources"):
                     _render_sources(msg["sources"])
@@ -747,7 +778,10 @@ def _render_chat_tab(cfg: dict[str, Any]) -> None:
             )
             return
 
-        placeholder.markdown(answer)
+        # Clear the spinner placeholder before re-rendering so the assistant
+        # block doesn't have a stale empty box above the actual content.
+        placeholder.empty()
+        _render_assistant_content(answer, key_prefix=f"new_{len(history)}")
         _render_sources(sources)
         _render_pdf_save_button(
             title=_truncate_for_title(user_input),

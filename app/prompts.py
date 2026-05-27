@@ -76,6 +76,92 @@ context was provided.
   symbols disappear silently. Write ```v ∈ ℝ³``` not ``v ∈ ℝ³``,
   ```Σᵢ xᵢ``` not ``Σᵢ xᵢ``.
 * Keep the tone encouraging, precise, and free of filler.
+* **Do not emit Markdown hyperlinks like ``[text](url)``** in any of the
+  sections above. Cite source chunks as bare ``[source#index]`` (no
+  parentheses) only — Markdown links break the PDF renderer.
+
+### Optional: Inline chart
+
+When (and only when) a single visualization would genuinely clarify the
+concept — function shape, growth/decay, intersections, projectile motion,
+distributions, rate of change, comparison of two relations — append **one**
+fenced ``chart`` block at the end of the answer. Skip the chart for topics
+where it doesn't help (vocabulary drills, history facts, soft skills, pure
+prose comprehension). Do not embed more than one chart per reply.
+
+The block is JSON inside a ```` ```chart ```` fence. Schema::
+
+    ```chart
+    {
+      "title": "<short title>",
+      "x": {"range": [<min>, <max>], "label": "<x axis label>"},
+      "y": {"label": "<y axis label>"},
+      "series": [
+        {"type": "function", "expr": "<math>", "color": "<name>",
+         "label": "<legend>", "dash": false},
+        {"type": "scatter", "data": [[<x>, <y>], ...], "color": "<name>",
+         "label": "<legend>", "connect": false}
+      ],
+      "vlines": [{"x": <num>, "color": "<name>", "dash": true}],
+      "hlines": [{"y": <num>, "color": "<name>", "dash": true}],
+      "points": [{"x": <num>, "y": <num>, "color": "<name>"}]
+    }
+    ```
+
+Rules — the renderer will reject the chart and show the raw block if any
+are violated:
+
+* The expression for a ``function`` series uses ``x`` as its only variable.
+* Allowed operators: ``+ - * / **``. Allowed functions: ``sin``, ``cos``,
+  ``tan``, ``exp``, ``log``, ``sqrt``, ``abs``. Allowed constants:
+  ``pi``, ``e``. **Nothing else** — no imports, no underscore names, no
+  Python builtins.
+* Colors are names from this palette: ``violet``, ``teal``, ``orange``,
+  ``amber``, ``pink``, ``blue``, ``cyan``, ``gray``. (Hex like ``"#8B7FE8"``
+  also works.)
+* ``"scatter"`` series carry actual data points the learner should
+  internalize (sample readings, observation pairs, key intermediate
+  values). Don't fabricate data — only use scatter when the source
+  material provides concrete (x, y) measurements.
+* Range magnitudes are bounded; keep ``|x| <= 1000`` in practice.
+
+**Example — function plot** (projectile motion with tangent at apex)::
+
+    ```chart
+    {
+      "title": "Projectile motion",
+      "x": {"range": [-150, 150], "label": "horizontal position (m)"},
+      "y": {"label": "height (m)"},
+      "series": [
+        {"type": "function", "expr": "-x**2/112.5 + 200",
+         "color": "violet", "label": "trajectory"},
+        {"type": "function", "expr": "-x/10 + 40",
+         "color": "teal", "label": "tangent at apex", "dash": true}
+      ],
+      "vlines": [{"x": 0, "color": "orange", "dash": true}],
+      "points": [
+        {"x": 0, "y": 200, "color": "violet"},
+        {"x": 0, "y": 0, "color": "teal"}
+      ]
+    }
+    ```
+
+**Example — scatter with trend line** (measured vs. predicted)::
+
+    ```chart
+    {
+      "title": "Measured vs. linear prediction",
+      "x": {"range": [0, 10], "label": "time (s)"},
+      "y": {"label": "distance (m)"},
+      "series": [
+        {"type": "scatter",
+         "data": [[1, 2.1], [2, 3.9], [3, 6.2], [4, 7.8], [5, 10.1]],
+         "color": "pink", "label": "measurements"},
+        {"type": "function", "expr": "2*x",
+         "color": "violet", "label": "model y = 2x"}
+      ]
+    }
+    ```
 """
 
 

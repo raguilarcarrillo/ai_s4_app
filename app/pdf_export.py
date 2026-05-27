@@ -363,6 +363,8 @@ def _build_filename(topic: str, *, suffix: str = "pdf") -> str:
 # ---------------------------------------------------------------------------
 
 _CODE_FENCE_RE = re.compile(r"^\s*```")
+_CHART_FENCE_OPEN_RE = re.compile(r"^\s*```chart\s*$")
+_CODE_FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BULLET_RE = re.compile(r"^\s*[-*+]\s+(.*)$")
 _NUMBERED_RE = re.compile(r"^\s*\d+\.\s+(.*)$")
@@ -493,6 +495,65 @@ def _render_table(pdf: FPDF, rows: list[list[str]], fonts: _FontSet) -> None:
     pdf.ln(2)
 
 
+def _embed_chart(pdf: FPDF, spec_text: str, fonts: _FontSet) -> None:
+    """Embed a ```chart`` block as a PNG, or a placeholder line on fallback.
+
+    Two failure modes both gracefully degrade:
+      * The chart spec doesn't parse — show ``[Chart: untitled]`` so the
+        reader at least sees that something was supposed to be here.
+      * Kaleido / Chrome aren't available — same placeholder line. This is
+        the expected outcome on hosts without Chrome installed (default
+        HuggingFace Space images).
+    """
+    # Lazy import — pdf_export still works without ``charts`` on the path
+    # for any caller that doesn't go through the LLM teacher prompt.
+    try:
+        import charts as _charts  # type: ignore
+    except ImportError:
+        _placeholder_chart(pdf, "untitled", fonts)
+        return
+
+    fig, err = _charts.render(spec_text)
+    if fig is None:
+        logger.info("chart spec did not parse for PDF embed: %s", err)
+        _placeholder_chart(
+            pdf, _charts.chart_title(spec_text), fonts, suffix="(spec error)"
+        )
+        return
+
+    png = _charts.figure_to_png(fig)
+    if png is None:
+        _placeholder_chart(pdf, _charts.chart_title(spec_text), fonts)
+        return
+
+    # Page-fit the image: leave the side margins, scale to ~75% of the
+    # available width so it doesn't dominate the page on A4.
+    import io
+
+    avail = pdf.w - pdf.l_margin - pdf.r_margin
+    target_w = avail * 0.92
+    pdf.ln(2)
+    try:
+        pdf.image(io.BytesIO(png), w=target_w, type="PNG")
+    except Exception:
+        logger.exception("pdf.image failed for chart PNG")
+        _placeholder_chart(pdf, _charts.chart_title(spec_text), fonts)
+        return
+    pdf.ln(2)
+
+
+def _placeholder_chart(
+    pdf: FPDF, title: str, fonts: _FontSet, *, suffix: str = ""
+) -> None:
+    """Render a one-line text placeholder where a chart could not be embedded."""
+    safe_title = _prepare_text(title or "untitled", unicode_ok=fonts.unicode_ok)
+    label = f"[Chart: {safe_title}]" + (f" {suffix}" if suffix else "")
+    pdf.set_font(fonts.body, style="I", size=10)
+    pdf.set_text_color(150, 150, 150)
+    _para(pdf, 6, label, markdown=False)
+    pdf.set_text_color(0, 0, 0)
+
+
 def _render_body(
     pdf: FPDF,
     markdown_text: str,
@@ -515,6 +576,20 @@ def _render_body(
     while i < len(raw_lines):
         raw_line = raw_lines[i]
         line = raw_line.rstrip()
+
+        # Chart fence — consume the JSON body, render the figure as PNG
+        # (or a placeholder line if kaleido isn't usable on this host).
+        if not in_code and _CHART_FENCE_OPEN_RE.match(line):
+            chart_lines: list[str] = []
+            j = i + 1
+            while j < len(raw_lines) and not _CODE_FENCE_CLOSE_RE.match(
+                raw_lines[j].rstrip()
+            ):
+                chart_lines.append(raw_lines[j])
+                j += 1
+            _embed_chart(pdf, "\n".join(chart_lines), fonts)
+            i = j + 1  # skip past the closing fence
+            continue
 
         if _CODE_FENCE_RE.match(line):
             in_code = not in_code

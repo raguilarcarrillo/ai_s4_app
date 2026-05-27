@@ -119,6 +119,38 @@ requirements.txt            # Pinned dependencies for all providers
 .streamlit/config.toml      # Streamlit server + theme config
 ```
 
+### Inline visualizations
+
+When a concept benefits from a picture — function shape, growth curves,
+projectile motion, scatter vs. trend — the teacher LLM is allowed to
+emit a single fenced ` ```chart` block at the end of its reply. The app
+parses the block and renders it as an interactive Plotly figure styled
+to match the rest of the dark theme.
+
+The block is JSON with two series types:
+
+- **`function`** — a closed-form expression in `x`. Allowed names:
+  `sin`, `cos`, `tan`, `exp`, `log`, `sqrt`, `abs`, plus constants `pi`
+  and `e`. Arbitrary code execution is prevented by an AST-whitelist
+  validator (see `app/charts.py`) — attribute access, comprehensions,
+  lambdas, dunder names, imports, subscripts, kwargs, and starred args
+  are all rejected pre-compile.
+- **`scatter`** — explicit `[x, y]` pairs (cap 1,000 points). Optional
+  `"connect": true` joins them with a line.
+
+Optional decorations: `vlines`, `hlines`, and `points` for reference
+lines and annotation markers (the dashed vertical + filled dot pattern
+from a typical math/physics plot).
+
+**PDF embed.** When the user clicks `📄 Download as PDF`, charts are
+exported to PNG via [kaleido](https://github.com/plotly/Kaleido) and
+embedded into the PDF. Kaleido v1.x requires **Chrome to be installed
+on the host** — most desktop OSes already have it. If Chrome isn't
+available (e.g. the default HuggingFace Space image), PDF export
+gracefully degrades to a `[Chart: <title>]` placeholder line. To enable
+full-fidelity PDF charts on a Space, add `chromium` to a top-level
+`packages.txt`.
+
 ### Session persistence (opt-in)
 
 By default, uploaded documents live only in RAM for the current browser
