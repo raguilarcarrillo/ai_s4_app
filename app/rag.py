@@ -13,6 +13,7 @@ prompt orchestration live elsewhere.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -25,7 +26,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md", ".markdown"}
+SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md", ".markdown", ".ipynb"}
 
 
 @dataclass
@@ -55,7 +56,8 @@ def _read_file_to_documents(path: Path, source_label: str) -> List[Document]:
         source_label: Original filename used as the ``source`` metadata.
 
     Returns:
-        Loaded ``Document`` objects (one per page for PDFs, one for text).
+        Loaded ``Document`` objects (one per page for PDFs, one per text
+        file, one per notebook).
 
     Raises:
         ValueError: If the file extension is unsupported.
@@ -71,12 +73,128 @@ def _read_file_to_documents(path: Path, source_label: str) -> List[Document]:
 
         loader = TextLoader(str(path), encoding="utf-8")
         docs = loader.load()
+    elif suffix == ".ipynb":
+        docs = _load_notebook(path, source_label)
     else:
         raise ValueError(f"Unsupported file extension: {suffix}")
 
     for d in docs:
         d.metadata["source"] = source_label
     return docs
+
+
+def _load_notebook(path: Path, source_label: str) -> List[Document]:
+    """Parse a Jupyter notebook into a single Document.
+
+    Only ``markdown`` and ``code`` cells contribute to the output; ``raw``
+    cells and *all* cell outputs are skipped on purpose:
+
+    * Notebook outputs can include arbitrary ``text/html`` /
+      ``application/javascript`` payloads and multi-MB base64-encoded
+      images. We don't render anything as raw HTML today, but skipping
+      outputs is defense-in-depth — if a future surface ever does, ipynb
+      outputs won't suddenly become an XSS or noise vector.
+    * Outputs frequently echo printed secrets (API tokens, env vars) the
+      author didn't intend to share. Skipping keeps those out of the
+      embedding index.
+
+    The code-fence language is taken from the notebook's
+    ``metadata.kernelspec.language`` but only when it matches Python's
+    identifier rules — otherwise we fall back to ``python``. This stops a
+    crafted notebook from injecting markup via the language string.
+
+    Args:
+        path: Path to the ``.ipynb`` file on disk.
+        source_label: Original filename, used in the error message and
+            attached to the returned Document by the caller.
+
+    Returns:
+        A list with a single Document, or an empty list if the notebook
+        had no usable cells.
+
+    Raises:
+        ValueError: If the file isn't valid JSON or isn't a notebook.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise ValueError(f"Could not read notebook {source_label}: {e}") from e
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{source_label} is not valid JSON: {e}"
+        ) from e
+    if not isinstance(data, dict) or not isinstance(data.get("cells"), list):
+        raise ValueError(
+            f"{source_label} does not look like a Jupyter notebook"
+        )
+
+    kernel = data.get("metadata", {}).get("kernelspec", {})
+    raw_lang = kernel.get("language", "") if isinstance(kernel, dict) else ""
+    lang = raw_lang if isinstance(raw_lang, str) and raw_lang.isidentifier() else "python"
+
+    parts: list[str] = []
+    for cell in data["cells"]:
+        if not isinstance(cell, dict):
+            continue
+        cell_type = cell.get("cell_type")
+        source = cell.get("source", "")
+        if isinstance(source, list):
+            source = "".join(s for s in source if isinstance(s, str))
+        if not isinstance(source, str):
+            continue
+        # Strip NULL bytes defensively — some downstream consumers (DBs,
+        # certain loaders) refuse them and there's no legitimate reason
+        # to embed one in a notebook source cell.
+        source = source.replace("\x00", "").strip()
+        if not source:
+            continue
+        if cell_type == "markdown":
+            parts.append(source)
+        elif cell_type == "code":
+            parts.append(f"```{lang}\n{source}\n```")
+        # "raw" cells (template / nbconvert directives) are intentionally
+        # ignored; "outputs" are not consulted at all.
+
+    if not parts:
+        return []
+    return [
+        Document(
+            page_content="\n\n".join(parts),
+            metadata={"source": source_label},
+        )
+    ]
+
+
+def load_disk_files(paths: Iterable[Path]) -> List[Document]:
+    """Load already-on-disk files into LangChain Documents.
+
+    Used by the persistence-restore path, where files are read back from
+    ``./.cache/sessions/<id>/files/``. Mirrors :func:`load_uploaded_files`
+    minus the tempdir dance.
+
+    Args:
+        paths: Iterable of absolute filesystem paths to load.
+
+    Returns:
+        Flat list of loaded ``Document`` objects across all inputs.
+    """
+    documents: List[Document] = []
+    for path in paths:
+        safe_name = path.name
+        if not safe_name or safe_name in {".", ".."}:
+            logger.warning("Skipping suspicious filename %r", path)
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_SUFFIXES:
+            logger.warning("Skipping unsupported file %s", safe_name)
+            continue
+        try:
+            documents.extend(_read_file_to_documents(path, safe_name))
+        except Exception:
+            logger.exception("Failed to load %s", safe_name)
+    return documents
 
 
 def load_uploaded_files(uploaded_files: Iterable[Any]) -> List[Document]:
@@ -240,21 +358,30 @@ def format_context_block(chunks: Sequence[RetrievedChunk]) -> str:
 def fingerprint(files: Iterable[Any], chunk_size: int, chunk_overlap: int) -> str:
     """Compute a deterministic cache key for an index built from ``files``.
 
-    Combines each file's name + byte content with the splitter parameters.
+    Combines each file's basename + byte content with the splitter
+    parameters. Accepts either Streamlit ``UploadedFile`` objects (with
+    ``.name`` / ``.getbuffer()``) or :class:`pathlib.Path` instances —
+    both produce the same digest for byte-identical content, so a
+    persisted session can collide-hit the in-memory and on-disk FAISS
+    caches built from the original upload.
 
     Args:
-        files: Streamlit ``UploadedFile`` objects.
+        files: Iterable of ``UploadedFile``-like objects or ``Path``s.
         chunk_size: Chunk size used by the splitter.
         chunk_overlap: Chunk overlap used by the splitter.
 
     Returns:
-        Hex digest suitable as a ``@st.cache_resource`` key.
+        Hex digest suitable as a cache key.
     """
     h = hashlib.sha256()
     h.update(f"cs={chunk_size};co={chunk_overlap};".encode())
     for f in files:
-        name = getattr(f, "name", "")
-        buf = f.getbuffer()
+        if isinstance(f, Path):
+            name = Path(f).name
+            payload = f.read_bytes()
+        else:
+            name = Path(getattr(f, "name", "")).name
+            payload = bytes(f.getbuffer())
         h.update(name.encode())
-        h.update(bytes(buf))
+        h.update(payload)
     return h.hexdigest()

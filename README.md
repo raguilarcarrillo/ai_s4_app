@@ -14,11 +14,12 @@ license: mit
 # 🎓 Smart Teacher
 
 **Smart Teacher** is an LLM-agnostic, retrieval-augmented AI tutor built with
-Streamlit + LangChain. Give it a topic and/or some documents (PDF, TXT, MD)
-and it returns a pedagogically-structured answer — explanation, recommended
-learning method for *that* subject, a step-by-step study plan, practice
-exercises, and self-check questions — with inline citations to your source
-material. It can also generate, grade, and review quizzes on demand.
+Streamlit + LangChain. Give it a topic and/or some documents (PDF, TXT, MD,
+Jupyter notebooks) and it returns a pedagogically-structured answer —
+explanation, recommended learning method for *that* subject, a step-by-step
+study plan, practice exercises, and self-check questions — with inline
+citations to your source material. It can also generate, grade, and review
+quizzes on demand.
 
 Switch between Anthropic, OpenAI, Gemini, Groq, HuggingFace, or local Ollama
 models from the sidebar at runtime — no code changes required.
@@ -117,6 +118,30 @@ requirements.txt            # Pinned dependencies for all providers
 .env.example                # Template for local env-var setup
 .streamlit/config.toml      # Streamlit server + theme config
 ```
+
+### Session persistence (opt-in)
+
+By default, uploaded documents live only in RAM for the current browser
+tab. Streamlit's `file_uploader` forgets them when the tab closes and the
+in-memory FAISS index is rebuilt on every cold start.
+
+A sidebar expander — **💾 Persistence (opt-in)** — lets a user save
+their uploaded files + index to disk and restore them later from a
+32-char hex token. Two layers under `./.cache/`:
+
+- `faiss/<content_fingerprint>/` — Shared, content-keyed FAISS index.
+  Anyone uploading byte-identical files reuses it.
+- `sessions/<sha256(token)>/` — Per-session raw files + `manifest.json`.
+  The directory name is the hash of the token, so listing the cache
+  doesn't reveal active tokens; only the user holds the raw value.
+
+The toggle is **off by default** — nothing is written to disk until the
+user actively opts in. Sessions auto-expire after 7 days of inactivity
+(`SMART_TEACHER_SESSION_TTL_DAYS`). On HuggingFace Spaces, the cache
+lives only for the container's lifetime unless you've upgraded to
+persistent storage and pointed `SMART_TEACHER_CACHE_DIR` at it (e.g.
+`/data/smart-teacher`). Anyone with the operator's filesystem access can
+read all persisted data — document this if you deploy.
 
 ### PDF export
 
@@ -270,10 +295,14 @@ populate inline `[source#index]` citations.
 
 ## Known limitations
 
-- **In-memory FAISS** is rebuilt on every Streamlit cold start. Fine for
-  ≤ ~100 MB of documents; for larger corpora persist the index to disk.
-- **Single-document session** — there's no cross-session knowledge base; each
-  user's uploads stay in their own `st.session_state`.
+- **In-memory FAISS** is rebuilt on every Streamlit cold start unless the
+  user opted in to persistence (see [Session persistence](#session-persistence-opt-in)).
+  Fine for ≤ ~100 MB of documents; for larger corpora prefer the
+  persistent FAISS cache or persist to a managed vector DB.
+- **Single-document session** — without persistence, each user's uploads
+  stay in their own `st.session_state` and aren't shared across sessions.
+  The opt-in persistence model uses share-link semantics (anyone with
+  the token can restore the session) rather than user accounts.
 - **Citation fidelity** depends on the underlying LLM. Smaller models
   (HuggingFace free tier, small Ollama models) sometimes hallucinate chunk
   ids — prefer Groq Llama-3.3-70B or Claude for reliable grounding.

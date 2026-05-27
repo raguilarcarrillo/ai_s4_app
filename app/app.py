@@ -51,6 +51,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import persistence  # noqa: E402
 from embeddings_factory import get_embeddings, list_embedding_backends  # noqa: E402
 from llm_factory import PROVIDERS, get_llm, list_providers  # noqa: E402
 from pdf_export import markdown_to_pdf_bytes, pdf_filename  # noqa: E402
@@ -61,6 +62,7 @@ from rag import (  # noqa: E402
     build_vector_store,
     fingerprint,
     format_context_block,
+    load_disk_files,
     load_uploaded_files,
     retrieve,
     split_documents,
@@ -115,14 +117,20 @@ def _cached_vector_store(
         chunk_overlap: Splitter chunk overlap.
         backend: Embeddings backend id (cache participation only).
         model: Embeddings model identifier (cache participation only).
-        _files: Streamlit ``UploadedFile`` list. Leading underscore tells
-            Streamlit not to hash this argument.
+        _files: Either Streamlit ``UploadedFile`` objects (fresh upload) or
+            :class:`pathlib.Path` objects (restored from disk). Leading
+            underscore tells Streamlit not to hash this argument.
         _embeddings: The embeddings instance. Same hashing exclusion.
 
     Returns:
         A FAISS vector store.
     """
-    docs = load_uploaded_files(_files)
+    if not _files:
+        raise ValueError("No files provided.")
+    if isinstance(_files[0], Path):
+        docs = load_disk_files(_files)
+    else:
+        docs = load_uploaded_files(_files)
     if not docs:
         raise ValueError(
             "No readable content found in the uploaded files."
@@ -131,6 +139,21 @@ def _cached_vector_store(
         docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
     return build_vector_store(chunks, _embeddings)
+
+
+# Cleanup runs once per process via @st.cache_resource memoization. Wrapped
+# in try/except so a misconfigured cache dir never blocks app startup.
+@st.cache_resource(show_spinner=False)
+def _run_startup_cleanup() -> bool:
+    try:
+        removed = persistence.cleanup_expired()
+        if removed:
+            logger.info(
+                "Persistence: cleaned %d expired session(s)", removed
+            )
+    except Exception:
+        logger.exception("Persistence cleanup failed")
+    return True
 
 
 def _key_hint(value: Optional[str]) -> str:
@@ -291,13 +314,17 @@ def _render_sidebar() -> dict[str, Any]:
 
     st.sidebar.subheader("Knowledge base")
     uploaded_files = st.sidebar.file_uploader(
-        "Upload PDF / TXT / MD files",
+        "Upload PDF / TXT / MD / IPYNB files",
         accept_multiple_files=True,
-        type=["pdf", "txt", "md", "markdown"],
-        help="Without uploads the app runs in *ungrounded* topic mode.",
+        type=["pdf", "txt", "md", "markdown", "ipynb"],
+        help="Without uploads the app runs in *ungrounded* topic mode. "
+        "For notebooks, only markdown + code cells are indexed; outputs "
+        "are skipped.",
     )
     if uploaded_files:
         st.sidebar.success(f"{len(uploaded_files)} file(s) ready to index.")
+
+    _render_persistence_section()
 
     st.sidebar.markdown("---")
     if st.sidebar.button("🗑️ Clear chat history", use_container_width=True):
@@ -314,7 +341,82 @@ def _render_sidebar() -> dict[str, Any]:
         "embed_backend": embed_backend,
         "embed_model": embed_model,
         "uploaded_files": uploaded_files or [],
+        "persist_enabled": bool(st.session_state.get("persist_enabled", False)),
     }
+
+
+def _render_persistence_section() -> None:
+    """Render the opt-in persistence controls in the sidebar.
+
+    Strict opt-in. Nothing is written to disk unless the user actively
+    checks the "Persist this session" box. The on-disk session directory
+    is ``sha256(token)`` so the raw token never lands on disk.
+    """
+    with st.sidebar.expander("💾 Persistence (opt-in)", expanded=False):
+        st.caption(
+            "Save your uploaded files + FAISS index to disk so you can "
+            "restore this session later with a token. Off by default — "
+            "nothing is persisted until you check the box."
+        )
+
+        st.checkbox(
+            "Persist this session",
+            value=st.session_state.get("persist_enabled", False),
+            key="persist_enabled",
+            help=(
+                "When on, files + manifest are written to "
+                "./.cache/sessions/. The directory name is the hash of "
+                "your token, so listing the cache alone doesn't reveal it."
+            ),
+        )
+
+        if st.session_state.get("persist_enabled"):
+            if "persist_token" not in st.session_state:
+                st.session_state["persist_token"] = persistence.new_token()
+            st.markdown("**Your session token** — copy and keep it safe:")
+            st.code(st.session_state["persist_token"], language="text")
+            st.caption(
+                "Anyone with this token can restore (and read) the "
+                "session. Treat it like a share link."
+            )
+
+        st.markdown("---")
+        restore_token = st.text_input(
+            "Restore from token",
+            value="",
+            help="Paste a 32-char hex token from a previous session.",
+            key="restore_input",
+        )
+        if st.button(
+            "🔗 Load session",
+            disabled=not restore_token.strip(),
+            use_container_width=True,
+        ):
+            try:
+                _, paths = persistence.load_session(restore_token.strip())
+            except persistence.PersistenceError as e:
+                st.error(str(e))
+            else:
+                st.session_state["restored_paths"] = paths
+                st.session_state["persist_enabled"] = True
+                st.session_state["persist_token"] = (
+                    restore_token.strip().lower()
+                )
+                st.success(f"Restored {len(paths)} file(s).")
+                st.rerun()
+
+        restored = st.session_state.get("restored_paths") or []
+        if restored:
+            st.info(
+                "Restored from previous session: "
+                + ", ".join(p.name for p in restored)
+            )
+            if st.button(
+                "🗑️ Clear restored session", use_container_width=True
+            ):
+                for k in ("restored_paths", "restore_input"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -354,34 +456,128 @@ def _get_llm_safe(cfg: dict[str, Any]) -> Optional[Any]:
 def _get_vector_store_safe(cfg: dict[str, Any]) -> Optional[Any]:
     """Build the vector store from current uploads, with UI error handling.
 
+    Sources are resolved with this precedence:
+      1. Fresh uploads via the file_uploader widget take priority.
+      2. Otherwise, files restored from a persisted session are used.
+      3. If neither is present, returns ``None`` (ungrounded mode).
+
+    Persistence layering (when ``cfg["persist_enabled"]`` is true):
+      * The on-disk FAISS cache at ``./.cache/faiss/<fingerprint>/`` is
+        checked first — a hit avoids any embedding work.
+      * On a miss, the in-memory ``@st.cache_resource`` path runs, and the
+        resulting FAISS index is then persisted to disk for next time.
+      * For *fresh* uploads, raw file bytes + manifest are written under
+        the per-session blob. Restored files are already on disk, so we
+        only refresh their manifest's ``last_accessed_at``.
+
     Args:
         cfg: Sidebar configuration dict.
 
     Returns:
         The vector store, or ``None`` if no files / on failure.
     """
-    files = cfg["uploaded_files"]
-    if not files:
+    uploaded = cfg.get("uploaded_files") or []
+    restored: list[Path] = st.session_state.get("restored_paths") or []
+
+    if uploaded:
+        inputs: list[Any] = list(uploaded)
+        is_restored = False
+    elif restored:
+        inputs = list(restored)
+        is_restored = True
+    else:
         return None
+
+    persist_on = bool(cfg.get("persist_enabled"))
+
     try:
         embeddings = _cached_embeddings(
             backend=cfg["embed_backend"],
             model=cfg["embed_model"],
         )
-        fp = fingerprint(files, cfg["chunk_size"], cfg["chunk_overlap"])
-        return _cached_vector_store(
-            index_fingerprint=fp,
-            chunk_size=cfg["chunk_size"],
-            chunk_overlap=cfg["chunk_overlap"],
-            backend=cfg["embed_backend"],
-            model=cfg["embed_model"],
-            _files=files,
-            _embeddings=embeddings,
-        )
+        fp = fingerprint(inputs, cfg["chunk_size"], cfg["chunk_overlap"])
+
+        vs: Optional[Any] = None
+        # Disk cache first when persistence is on; also when we're already
+        # restoring (the index is probably there from the original save).
+        if persist_on or is_restored:
+            try:
+                vs = persistence.load_faiss(fp, embeddings)
+            except Exception:
+                logger.exception("FAISS disk-cache load failed")
+
+        if vs is None:
+            vs = _cached_vector_store(
+                index_fingerprint=fp,
+                chunk_size=cfg["chunk_size"],
+                chunk_overlap=cfg["chunk_overlap"],
+                backend=cfg["embed_backend"],
+                model=cfg["embed_model"],
+                _files=inputs,
+                _embeddings=embeddings,
+            )
+
+        if persist_on:
+            # Streamlit reruns _get_vector_store_safe on every interaction,
+            # so we gate the actual disk writes behind a per-session marker.
+            # Rewriting a 100 MB PDF on every chat message is otherwise a
+            # real possibility.
+            token = st.session_state.get("persist_token") or persistence.new_token()
+            st.session_state["persist_token"] = token
+            marker = f"persist_marker::{token}::{fp}"
+            if marker not in st.session_state:
+                _save_to_persistence(
+                    vs, fp, inputs, is_restored=is_restored, cfg=cfg
+                )
+                st.session_state[marker] = True
+
+        return vs
     except Exception as e:
         st.error(_redact_secrets(f"Failed to index documents: {e}"))
         logger.exception("Indexing failed")
         return None
+
+
+def _save_to_persistence(
+    vs: Any,
+    fp: str,
+    inputs: list[Any],
+    *,
+    is_restored: bool,
+    cfg: dict[str, Any],
+) -> None:
+    """Persist the FAISS index and (for fresh uploads) the session blob.
+
+    Errors are surfaced as a sidebar warning but never block indexing.
+    The caller is responsible for ensuring this only runs once per
+    ``(token, fingerprint)`` to avoid rewriting bytes on every Streamlit
+    rerun.
+    """
+    token = st.session_state["persist_token"]  # caller guarantees this exists
+    try:
+        persistence.save_faiss(fp, vs)
+        if not is_restored:
+            payload = [
+                (
+                    Path(getattr(f, "name", "uploaded")).name,
+                    bytes(f.getbuffer()),
+                )
+                for f in inputs
+            ]
+            persistence.save_session(
+                token,
+                payload,
+                fingerprint=fp,
+                chunk_size=cfg["chunk_size"],
+                chunk_overlap=cfg["chunk_overlap"],
+                embed_backend=cfg["embed_backend"],
+                embed_model=cfg["embed_model"],
+            )
+    except persistence.PersistenceError as e:
+        st.sidebar.warning(f"Persistence skipped: {e}")
+    except Exception:
+        logger.exception("Persistence save failed")
+        st.sidebar.warning("Persistence save failed; see server logs.")
 
 
 def _get_pdf_bytes(title: str, content: str) -> bytes:
@@ -985,6 +1181,8 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    # Best-effort TTL sweep — runs once per process via @st.cache_resource.
+    _run_startup_cleanup()
     st.title("🎓 Smart Teacher")
     st.caption(
         "An LLM-agnostic AI tutor with retrieval-grounded answers and "
