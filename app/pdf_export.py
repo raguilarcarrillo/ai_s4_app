@@ -281,9 +281,36 @@ def _sanitize_for_core_font(text: str) -> str:
     return normalized.encode("latin-1", errors="replace").decode("latin-1")
 
 
-def _prepare_text(text: str, *, unicode_ok: bool) -> str:
-    """Apply emoji-tagging and (if needed) latin-1 sanitization."""
+# fpdf2 2.8.7's markdown-link parser turns every ``[label](#anchor)`` into a
+# placeholder named destination it expects us to resolve via set_link(name=...)
+# later — and crashes ``pdf.output()`` if we don't. We have no way to make
+# LLM-generated anchors stable (the model may emit ``[See §1](#1)``,
+# ``[1](#1)``, etc. at any time), and PDF link clickability is moot for files
+# read offline from Downloads. Flatten the construct to plain ``label`` before
+# fpdf2 sees it. Also covers invalid-URL and links-inside-bold edge cases.
+_MD_LINK_RE: Final[re.Pattern[str]] = re.compile(r"\[([^\[\]]+)\]\(([^()]+)\)")
+
+
+def _flatten_markdown_links(text: str) -> str:
+    """Replace ``[label](url)`` with ``label`` everywhere in ``text``."""
+    return _MD_LINK_RE.sub(r"\1", text or "")
+
+
+def _prepare_text(
+    text: str, *, unicode_ok: bool, flatten_links: bool = True
+) -> str:
+    """Apply emoji-tagging, link-flattening, and (if needed) latin-1 sanitization.
+
+    Args:
+        text: Source string from the markdown body.
+        unicode_ok: Whether the registered fonts cover non-latin-1 glyphs.
+        flatten_links: Strip ``[label](url)`` markdown links to ``label``.
+            Default ``True``; pass ``False`` only inside fenced code blocks
+            where a literal ``[foo](bar)`` should be preserved.
+    """
     text = _emoji_to_tags(text or "")
+    if flatten_links:
+        text = _flatten_markdown_links(text)
     if not unicode_ok:
         text = _sanitize_for_core_font(text)
     return text
@@ -496,7 +523,11 @@ def _render_body(
             continue
 
         if in_code:
-            prepared = _prepare_text(line or " ", unicode_ok=fonts.unicode_ok)
+            prepared = _prepare_text(
+                line or " ",
+                unicode_ok=fonts.unicode_ok,
+                flatten_links=False,
+            )
             pdf.set_font(fonts.mono, size=9)
             pdf.set_fill_color(245, 245, 245)
             _para(pdf, 5, prepared, markdown=False, fill=True)
